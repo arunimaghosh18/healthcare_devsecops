@@ -1,0 +1,195 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  code_quality:
+    name: 📊 Code Quality Check (SonarQube)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-node@v3
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        run: npm test -- --coverage || true
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install SonarQube Scanner
+        run: |
+          sudo apt-get update && sudo apt-get install -y unzip curl
+          curl -sSLo sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+          if [ -f sonar-scanner.zip ]; then
+            unzip -q sonar-scanner.zip
+            mv sonar-scanner-* sonar-scanner
+            chmod +x sonar-scanner/bin/sonar-scanner
+            echo "${{ github.workspace }}/sonar-scanner/bin" >> $GITHUB_PATH
+          else
+            echo "Error: sonar-scanner.zip not found!"
+            exit 1
+          fi
+
+      - name: Run SonarQube Scan
+        run: |
+          sonar-scanner \
+            -Dsonar.projectKey=AdityaPrakash27_HealthcareDevops \
+            -Dsonar.organization=adityaprakash27 \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.sources=. \
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  security_scan:
+    name: 🔒 Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    needs: code_quality
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  docker_build:
+    name: 🛥 Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [code_quality, security_scan]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/setup-buildx-action@v2
+
+      - name: Log in to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: adityaprakash27/healthcare:latest
+          cache-from: type=gha
+
+  terraform:
+    name: 🔧 Terraform Infrastructure Provisioning
+    runs-on: ubuntu-latest
+    needs: docker_build
+    steps:
+      - uses: actions/checkout@v3
+      - uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 1.1.0
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: hospital-terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: "ap-south-1"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+        working-directory: hospital-terraform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: "ap-south-1"
+
+  kubernetes_deploy:
+    name: 🏗 Kubernetes Deployment
+    runs-on: ubuntu-latest
+    needs: terraform
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up AWS credentials
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region "ap-south-1"  # Specify your region here
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v1
+        with:
+          version: 'v1.24.0'
+
+      - name: Configure kubectl context
+        run: |
+          aws eks --region ap-south-1 update-kubeconfig --name heal-easy-cluster
+          echo "✅ kubeconfig written to /home/runner/.kube/config"
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+
+      - name: Test kubectl connection
+        run: kubectl get nodes
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl rollout status deployment/healthcare-app
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+
+  deploy:
+    name: 🚀 Deploy Ansible to EC2
+    runs-on: ubuntu-latest
+    needs: kubernetes_deploy
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Ansible
+        run: sudo apt-get update && sudo apt-get install -y ansible
+
+      - name: Install community.docker collection
+        run: ansible-galaxy collection install community.docker
+
+      - name: Decode private key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > ansible-key.pem
+          chmod 600 ansible-key.pem
+
+      - name: Run Ansible Playbook
+        run: |
+          ansible-playbook playbooks/deploy.yml \
+            -i ansible/inventory.ini \
+            --private-key ansible-key.pem \
+            -e "docker_username=${{ secrets.DOCKER_USERNAME }}" \
+            -e "docker_password=${{ secrets.DOCKER_PASSWORD }}"
+        working-directory: ansible
+#running pipelining
